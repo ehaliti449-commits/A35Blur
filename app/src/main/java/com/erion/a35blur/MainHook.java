@@ -6,12 +6,11 @@ import java.lang.reflect.Modifier;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.regex.Pattern;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XC_MethodReplacement;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
@@ -21,45 +20,14 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String TARGET_PKG = "com.android.systemui";
     private static final String BLUR_PROP = "ro.surface_flinger.supports_background_blur";
 
-    private static final String[] METHOD_CLASSES = {
-        "com.android.systemui.statusbar.BlurUtils",
-        "com.android.systemui.blur.data.repository.SecBlurSettingsRepositoryImpl",
-        "com.android.systemui.blur.domain.interactor.SecBlurSettingsInteractor",
-        "com.android.systemui.blur.data.repository.SecCapturedBlurRepositoryImpl",
-        "com.android.systemui.blur.domain.interactor.SecCapturedBlurInteractor",
-        "com.android.systemui.blur.domain.interactor.SecCapturedBlurInfoInteractor",
-        "com.android.systemui.blur.domain.interactor.SecPanelWindowBlurInteractor",
-        "com.android.systemui.blur.ui.viewmodel.SecCapturedBlurContainerViewModel",
-        "com.android.systemui.blur.ui.viewbinder.SecCapturedBlurContainerBinder",
-        "com.android.systemui.statusbar.phone.CapturedBlurContainer",
-        "com.android.systemui.blur.SecQpBlurController",
-        "com.android.systemui.blur.SecCoverBlurController",
-        "com.android.systemui.statusbar.policy.QuickPanelBlur",
-        "com.android.systemui.window.data.repository.WindowRootViewBlurRepositoryImpl",
-        "com.android.systemui.window.domain.interactor.WindowRootViewBlurInteractor",
-        "com.android.systemui.globalactions.features.CapturedBlurStrategy",
-        "com.android.systemui.keyguard.ui.transitions.GlanceableHubBlurProvider",
-        "androidx.core.view.SemBlurCompat",
-    };
-
     private static final String[] FLAG_CLASSES = {
         "com.android.systemui.LsRune",
-        "com.android.systemui.Rune",
         "com.android.systemui.BasicRune",
-        "androidx.core.view.SemBlurCompat",
-        "com.android.systemui.statusbar.BlurUtils",
+        "com.android.systemui.Rune",
     };
 
-    private static final Set<String> FORCE_TRUE = new HashSet<>(Arrays.asList(
-        "supportsBlursOnWindows", "isBlurSupported", "isCapturedBlurSupported",
-        "isCapturedBlurAllowed", "isBlurCurrentlySupported", "isSupportBlur",
-        "isBlurEnable", "isBlurEnabled", "isBlurredWallpaperOnShadeSupported",
-        "isCrossWindowBlurEnabled"));
-
-    private static final Pattern BAD_FLAG =
-        Pattern.compile("DEBUG|FORCE|OFF|DISABLE|REDUCE|BLOCK|NOT_|NO_|DISALLOW");
-
-    private static final ConcurrentHashMap<String, String> LAST = new ConcurrentHashMap<>();
+    private static final Set<String> FORCE_FLAGS = new HashSet<>(Arrays.asList(
+        "LOCKUI_BLUR", "LOCKUI_SHORTCUT_BLUR_BG"));
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) {
@@ -79,11 +47,15 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             });
         } catch (Throwable e) {
-            XposedBridge.log("A35Blur: prop hook failed: " + e);
+            XposedBridge.log("A35Fail prop hook: " + e);
         }
 
-        for (String cn : METHOD_CLASSES) {
-            hookClass(cn, cl);
+        try {
+            Class<?> bu = XposedHelpers.findClass("com.android.systemui.statusbar.BlurUtils", cl);
+            XposedBridge.hookAllMethods(bu, "supportsBlursOnWindows",
+                XC_MethodReplacement.returnConstant(true));
+        } catch (Throwable e) {
+            XposedBridge.log("A35Fail BlurUtils: " + e);
         }
 
         final AtomicBoolean done = new AtomicBoolean(false);
@@ -96,46 +68,8 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
                 });
         } catch (Throwable e) {
-            XposedBridge.log("A35Blur: onCreate hook failed: " + e);
+            XposedBridge.log("A35Fail onCreate hook: " + e);
             setFlags(cl);
-        }
-    }
-
-    private static void hookClass(String cn, ClassLoader cl) {
-        try {
-            Class<?> c = XposedHelpers.findClassIfExists(cn, cl);
-            if (c == null) {
-                XposedBridge.log("A35Trace: no class " + cn);
-                return;
-            }
-            int n = 0;
-            for (Method m : c.getDeclaredMethods()) {
-                if (m.getReturnType() != boolean.class || m.getParameterTypes().length != 0) continue;
-                final String name = m.getName();
-                if (name.contains("$")) continue;
-                final boolean force = FORCE_TRUE.contains(name);
-                if (!force && !name.toLowerCase().contains("blur")) continue;
-                final String key = c.getSimpleName() + "#" + name;
-                try {
-                    XposedBridge.hookMethod(m, new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam p) {
-                            try {
-                                Object old = p.getResult();
-                                if (force) p.setResult(true);
-                                String s = old + (force ? "->true" : "");
-                                if (!s.equals(LAST.put(key, s))) {
-                                    XposedBridge.log("A35Trace " + key + " = " + s);
-                                }
-                            } catch (Throwable ignored) { }
-                        }
-                    });
-                    n++;
-                } catch (Throwable ignored) { }
-            }
-            XposedBridge.log("A35Trace: " + c.getSimpleName() + " hooked " + n);
-        } catch (Throwable e) {
-            XposedBridge.log("A35Trace: skip " + cn + ": " + e);
         }
     }
 
@@ -144,27 +78,72 @@ public class MainHook implements IXposedHookLoadPackage {
             try {
                 Class<?> c = XposedHelpers.findClassIfExists(cn, cl);
                 if (c == null) {
-                    XposedBridge.log("A35Flag: no class " + cn);
+                    XposedBridge.log("A35Flag no class " + cn);
                     continue;
                 }
                 for (Field f : c.getDeclaredFields()) {
                     try {
                         if (f.getType() != boolean.class) continue;
                         if (!Modifier.isStatic(f.getModifiers())) continue;
-                        String up = f.getName().toUpperCase();
-                        if (!up.contains("BLUR") || BAD_FLAG.matcher(up).find()) continue;
+                        String name = f.getName();
+                        if (!name.toUpperCase().contains("BLUR")) continue;
                         f.setAccessible(true);
                         boolean old = f.getBoolean(null);
-                        if (!old) f.setBoolean(null, true);
-                        XposedBridge.log("A35Flag " + c.getSimpleName() + "." + f.getName()
-                            + " " + old + (old ? "" : "->true"));
+                        if (FORCE_FLAGS.contains(name) && !old) {
+                            boolean ok = forceSet(f, true);
+                            XposedBridge.log("A35Set " + c.getSimpleName() + "." + name
+                                + " ok=" + ok + " now=" + f.getBoolean(null));
+                        } else {
+                            XposedBridge.log("A35Flag " + c.getSimpleName() + "." + name + " " + old);
+                        }
                     } catch (Throwable t) {
-                        XposedBridge.log("A35Flag: field " + f.getName() + ": " + t);
+                        XposedBridge.log("A35Fail field " + f.getName() + ": " + t);
                     }
                 }
             } catch (Throwable e) {
-                XposedBridge.log("A35Flag: skip " + cn + ": " + e);
+                XposedBridge.log("A35Fail class " + cn + ": " + e);
             }
         }
+    }
+
+    private static boolean forceSet(Field f, boolean v) {
+        String n = f.getName();
+        try {
+            f.setAccessible(true);
+            f.setBoolean(null, v);
+            if (f.getBoolean(null) == v) return true;
+        } catch (Throwable t) {
+            XposedBridge.log("A35Fail plain " + n + ": " + t);
+        }
+        try {
+            Field af = Field.class.getDeclaredField("accessFlags");
+            af.setAccessible(true);
+            af.setInt(f, af.getInt(f) & ~Modifier.FINAL);
+            f.setBoolean(null, v);
+            if (f.getBoolean(null) == v) {
+                XposedBridge.log("A35Set method=accessFlags " + n);
+                return true;
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("A35Fail accessFlags " + n + ": " + t);
+        }
+        try {
+            Field uf = Class.forName("sun.misc.Unsafe").getDeclaredField("theUnsafe");
+            uf.setAccessible(true);
+            Object unsafe = uf.get(null);
+            Field of = Field.class.getDeclaredField("offset");
+            of.setAccessible(true);
+            long off = ((Number) of.get(f)).longValue();
+            Method put = unsafe.getClass().getMethod("putBoolean",
+                Object.class, long.class, boolean.class);
+            put.invoke(unsafe, f.getDeclaringClass(), off, v);
+            if (f.getBoolean(null) == v) {
+                XposedBridge.log("A35Set method=unsafe " + n);
+                return true;
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("A35Fail unsafe " + n + ": " + t);
+        }
+        return false;
     }
 }
