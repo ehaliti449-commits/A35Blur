@@ -6,6 +6,7 @@ import java.lang.reflect.Modifier;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -19,15 +20,14 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TARGET_PKG = "com.android.systemui";
     private static final String BLUR_PROP = "ro.surface_flinger.supports_background_blur";
-
     private static final String[] FLAG_CLASSES = {
         "com.android.systemui.LsRune",
         "com.android.systemui.BasicRune",
         "com.android.systemui.Rune",
     };
-
     private static final Set<String> FORCE_FLAGS = new HashSet<>(Arrays.asList(
         "LOCKUI_BLUR", "LOCKUI_SHORTCUT_BLUR_BG"));
+    private static final ConcurrentHashMap<String, Boolean> SEEN = new ConcurrentHashMap<>();
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) {
@@ -58,6 +58,11 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedBridge.log("A35Fail BlurUtils: " + e);
         }
 
+        probe("android.view.SurfaceControl$Transaction", "setBackgroundBlurRadius", cl);
+        probe("com.android.internal.graphics.drawable.BackgroundBlurDrawable", "setBlurRadius", cl);
+        probe("android.view.View", "semSetBlurInfo", cl);
+        probe("android.view.ViewRootImpl", "createBackgroundBlurDrawable", cl);
+
         final AtomicBoolean done = new AtomicBoolean(false);
         try {
             XposedHelpers.findAndHookMethod(android.app.Application.class, "onCreate",
@@ -73,28 +78,60 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+    private static String callers() {
+        StringBuilder sb = new StringBuilder();
+        int n = 0;
+        for (StackTraceElement e : new Throwable().getStackTrace()) {
+            String c = e.getClassName();
+            if (c.startsWith("com.android.systemui")) {
+                sb.append(" < ").append(c).append('.').append(e.getMethodName());
+                if (++n >= 4) break;
+            }
+        }
+        return sb.toString();
+    }
+
+    private static void probe(String cn, final String mn, ClassLoader cl) {
+        try {
+            Class<?> c = XposedHelpers.findClassIfExists(cn, cl);
+            if (c == null) {
+                XposedBridge.log("A35Probe no class " + cn);
+                return;
+            }
+            final String tag = c.getSimpleName() + "#" + mn;
+            XposedBridge.hookAllMethods(c, mn, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam p) {
+                    try {
+                        if (SEEN.size() > 300) return;
+                        String key = tag + " " + Arrays.toString(p.args);
+                        if (SEEN.putIfAbsent(key, Boolean.TRUE) == null) {
+                            XposedBridge.log("A35Probe " + key + callers());
+                        }
+                    } catch (Throwable ignored) { }
+                }
+            });
+            XposedBridge.log("A35Probe hooked " + tag);
+        } catch (Throwable e) {
+            XposedBridge.log("A35Probe skip " + cn + ": " + e);
+        }
+    }
+
     private static void setFlags(ClassLoader cl) {
         for (String cn : FLAG_CLASSES) {
             try {
                 Class<?> c = XposedHelpers.findClassIfExists(cn, cl);
-                if (c == null) {
-                    XposedBridge.log("A35Flag no class " + cn);
-                    continue;
-                }
+                if (c == null) continue;
                 for (Field f : c.getDeclaredFields()) {
                     try {
                         if (f.getType() != boolean.class) continue;
                         if (!Modifier.isStatic(f.getModifiers())) continue;
                         String name = f.getName();
-                        if (!name.toUpperCase().contains("BLUR")) continue;
+                        if (!FORCE_FLAGS.contains(name)) continue;
                         f.setAccessible(true);
-                        boolean old = f.getBoolean(null);
-                        if (FORCE_FLAGS.contains(name) && !old) {
+                        if (!f.getBoolean(null)) {
                             boolean ok = forceSet(f, true);
-                            XposedBridge.log("A35Set " + c.getSimpleName() + "." + name
-                                + " ok=" + ok + " now=" + f.getBoolean(null));
-                        } else {
-                            XposedBridge.log("A35Flag " + c.getSimpleName() + "." + name + " " + old);
+                            XposedBridge.log("A35Set " + c.getSimpleName() + "." + name + " ok=" + ok);
                         }
                     } catch (Throwable t) {
                         XposedBridge.log("A35Fail field " + f.getName() + ": " + t);
@@ -107,26 +144,18 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private static boolean forceSet(Field f, boolean v) {
-        String n = f.getName();
         try {
             f.setAccessible(true);
             f.setBoolean(null, v);
             if (f.getBoolean(null) == v) return true;
-        } catch (Throwable t) {
-            XposedBridge.log("A35Fail plain " + n + ": " + t);
-        }
+        } catch (Throwable ignored) { }
         try {
             Field af = Field.class.getDeclaredField("accessFlags");
             af.setAccessible(true);
             af.setInt(f, af.getInt(f) & ~Modifier.FINAL);
             f.setBoolean(null, v);
-            if (f.getBoolean(null) == v) {
-                XposedBridge.log("A35Set method=accessFlags " + n);
-                return true;
-            }
-        } catch (Throwable t) {
-            XposedBridge.log("A35Fail accessFlags " + n + ": " + t);
-        }
+            if (f.getBoolean(null) == v) return true;
+        } catch (Throwable ignored) { }
         try {
             Field uf = Class.forName("sun.misc.Unsafe").getDeclaredField("theUnsafe");
             uf.setAccessible(true);
@@ -137,13 +166,8 @@ public class MainHook implements IXposedHookLoadPackage {
             Method put = unsafe.getClass().getMethod("putBoolean",
                 Object.class, long.class, boolean.class);
             put.invoke(unsafe, f.getDeclaringClass(), off, v);
-            if (f.getBoolean(null) == v) {
-                XposedBridge.log("A35Set method=unsafe " + n);
-                return true;
-            }
-        } catch (Throwable t) {
-            XposedBridge.log("A35Fail unsafe " + n + ": " + t);
-        }
+            if (f.getBoolean(null) == v) return true;
+        } catch (Throwable ignored) { }
         return false;
     }
 }
